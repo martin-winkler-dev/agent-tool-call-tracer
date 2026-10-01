@@ -1,0 +1,50 @@
+# General
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+*.tgz
+*.tar.gz
+
+# Dependencies
+node_modules/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+npm-debug.log*
+yarn-error.log*
+# bun.lock is committed
+
+# Agents
+.agents/
+AGENTS.md
+.claude/
+CLAUDE.md
+
+# Build
+dist/
+build/
+*.tsbuildinfo
+
+# Database
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-journal
+
+# Env
+.env
+.env.*
+!.env.example
+
+# Temp & Coverage
+temp/
+*.temp
+scratch/
+*.scratch
+.cache/
+coverage/
+coverage.txt
+*.log

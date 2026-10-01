@@ -1,0 +1,12 @@
+{
+  "name": "agent-tool-call-tracer",
+  "version": "1.0.0",
+  "description": "Logs every tool call of Claude Code and Google Antigravity 2.0 (agy) to a local SQLite database.",
+  "author": {
+    "name": "Martin Winkler"
+  },
+  "homepage": "https://github.com/martin-winkler-dev/agent-tool-call-tracer#readme",
+  "repository": "https://github.com/martin-winkler-dev/agent-tool-call-tracer",
+  "license": "Apache-2.0",
+  "keywords": ["agent", "logging", "tracing", "hooks", "sqlite", "claude-code", "antigravity", "agy"]
+}

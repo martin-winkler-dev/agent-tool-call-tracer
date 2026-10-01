@@ -1,0 +1,17 @@
+{
+  "agent-tool-call-tracer": {
+    "enabled": true,
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun hooks/agent-tool-call-tracer.ts --agent agy",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
