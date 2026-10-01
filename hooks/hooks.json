@@ -1,0 +1,33 @@
+{
+  "description": "Log every tool call to ~/.agent-tool-call-tracer/log.sqlite",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/agent-tool-call-tracer.ts", "--agent", "claude"],
+            "async": true,
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/agent-tool-call-tracer.ts", "--agent", "claude"],
+            "async": true,
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
