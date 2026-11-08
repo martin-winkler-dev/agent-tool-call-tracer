@@ -1,8 +1,8 @@
 import { Database } from 'bun:sqlite';
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
     detectAgent,
@@ -54,19 +54,24 @@ function rows(): Json[] {
     }
 }
 
-// planner step 4 calls two view_file tools in parallel; results 5 and 6 are written out of order.
+// planner step 4 calls two read_file tools in parallel; results 5 and 6 are written out of order.
 // step 3 is written as RUNNING first and rewritten as DONE.
 const AGY_LINES = [
-    line({ step_index: 3, type: 'RUN_COMMAND', status: 'RUNNING', content: 'partial' }),
+    line({ step_index: 3, type: 'GENERIC', status: 'RUNNING', content: 'partial' }),
     line({
         step_index: 4,
         type: 'PLANNER_RESPONSE',
         status: 'DONE',
-        tool_calls: [{ name: 'view_file' }, { name: 'view_file' }],
+        tool_calls: [{ name: 'read_file' }, { name: 'read_file' }],
     }),
-    line({ step_index: 6, type: 'VIEW_FILE', status: 'DONE', content: 'content of b' }),
-    line({ step_index: 5, type: 'VIEW_FILE', status: 'DONE', content: 'content of a' }),
-    line({ step_index: 3, type: 'RUN_COMMAND', status: 'DONE', exit_code: 3, content: 'x'.repeat(10_000) }),
+    line({ step_index: 6, type: 'GENERIC', status: 'DONE', content: 'content of b' }),
+    line({ step_index: 5, type: 'GENERIC', status: 'DONE', content: 'content of a' }),
+    line({
+        step_index: 3,
+        type: 'GENERIC',
+        status: 'DONE',
+        content: 'Command exited with code 3.\n'.padEnd(10_000, 'x'),
+    }),
 ];
 
 function agyPayload(stepIdx: number | string, toolCall: Json, transcriptPath: string): Json {
@@ -119,6 +124,7 @@ describe('claude', () => {
             cwd: 'C:/elsewhere',
             hook_event_name: 'PostToolUse',
             permission_mode: 'default',
+            bash_response: { isImage: false },
         });
     });
 
@@ -214,7 +220,7 @@ describe('agy', () => {
 
     test('the hook inserts the call without output, because AGY writes the result step afterwards', () => {
         const path = writeTranscript(join(dir, 'logs'), AGY_LINES.slice(0, 2));
-        log(agyPayload(5, { name: 'view_file', args: { AbsolutePath: 'a.txt' } }, path));
+        log(agyPayload(5, { name: 'read_file', args: { Path: 'a.txt' } }, path));
         expect(rows()).toMatchObject([
             {
                 agent: 'agy',
@@ -233,63 +239,68 @@ describe('agy', () => {
     test('the next call fills earlier calls, each from its own result step', () => {
         const logs = join(dir, 'logs');
         const path = writeTranscript(logs, AGY_LINES.slice(0, 2));
-        log(agyPayload(5, { name: 'view_file', args: { AbsolutePath: 'a.txt' } }, path));
-        log(agyPayload(6, { name: 'view_file', args: { AbsolutePath: 'b.txt' } }, path));
+        log(agyPayload(5, { name: 'read_file', args: { Path: 'a.txt' } }, path));
+        log(agyPayload(6, { name: 'read_file', args: { Path: 'b.txt' } }, path));
         writeTranscript(logs, AGY_LINES);
-        log(agyPayload('7', { name: 'list_dir', args: {} }, path));
+        log(agyPayload('7', { name: 'read_file', args: {} }, path));
         expect(rows()).toMatchObject([
             { call_id: '5', output: 'content of a', failed: 0 },
             { call_id: '6', output: 'content of b', failed: 0 },
             { call_id: '7', output: null },
         ]);
-        expect(JSON.parse(String(rows()[0]?.extra))).toMatchObject({ step_type: 'VIEW_FILE', step_status: 'DONE' });
+        expect(JSON.parse(String(rows()[0]?.extra))).toMatchObject({ step_type: 'GENERIC', step_status: 'DONE' });
     });
 
     test('a RUNNING step stays pending until it is rewritten as DONE', () => {
         const logs = join(dir, 'logs');
         const path = writeTranscript(logs, AGY_LINES.slice(0, 1));
         log(agyPayload(3, { name: 'run_command', args: { CommandLine: 'exit 3' } }, path));
-        log(agyPayload(9, { name: 'view_file', args: {} }, path));
+        log(agyPayload(9, { name: 'read_file', args: {} }, path));
         expect(rows()[0]).toMatchObject({ output: 'partial', exit_code: null, failed: 0 });
         writeTranscript(logs, AGY_LINES);
-        log(agyPayload(10, { name: 'view_file', args: {} }, path));
+        log(agyPayload(10, { name: 'read_file', args: {} }, path));
         expect(rows()[0]).toMatchObject({ command: 'exit 3', exit_code: 3, failed: 1, output_chars: 10_000 });
     });
 
-    test('a background task is marked BACKGROUND and still filled if AGY rewrites its step', () => {
+    test('a background task is marked BACKGROUND and only fillLog fills it if AGY rewrites its step', () => {
         const logs = join(dir, 'logs');
         const started =
             'Created At: 2026-10-01T19:12:28+02:00\nTool is running as a background task with task id: c/task-3';
         const path = writeTranscript(logs, [
-            line({ step_index: 3, type: 'RUN_COMMAND', status: 'RUNNING', content: started }),
+            line({ step_index: 3, type: 'GENERIC', status: 'RUNNING', content: started }),
         ]);
         log(agyPayload(3, { name: 'run_command', args: { CommandLine: 'bun dev' } }, path));
-        log(agyPayload(9, { name: 'view_file', args: {} }, path));
+        log(agyPayload(9, { name: 'read_file', args: {} }, path));
         expect(JSON.parse(String(rows()[0]?.extra))).toMatchObject({ step_status: 'BACKGROUND' });
         expect(fillLog()).toEqual({ filled: 0, pending: 1, background: 1 });
         writeTranscript(logs, [
-            line({ step_index: 3, type: 'RUN_COMMAND', status: 'DONE', content: 'The command exited with code 0' }),
+            line({ step_index: 3, type: 'GENERIC', status: 'DONE', content: 'Command exited with code 0' }),
         ]);
-        expect(fillLog()).toEqual({ filled: 1, pending: 1, background: 0 });
-        expect(rows()[0]).toMatchObject({ output: 'The command exited with code 0', exit_code: 0 });
+        // the live hook skips BACKGROUND rows, so the next call does not read the rewritten step
+        log(agyPayload(10, { name: 'read_file', args: {} }, path));
+        expect(JSON.parse(String(rows()[0]?.extra))).toMatchObject({ step_status: 'BACKGROUND' });
+        expect(fillLog()).toEqual({ filled: 1, pending: 2, background: 0 });
+        expect(rows()[0]).toMatchObject({ output: 'Command exited with code 0', exit_code: 0 });
     });
 
-    test('a GENERIC run_command result gives its exit code in the content', () => {
-        const content = 'Created At: x\n\nThe command exited with code 2.\nOutput:\nboom\n';
+    test('a run_command result gives its exit code in the content', () => {
+        // the output itself may contain the same phrase; only the header line counts
+        const content =
+            'Created At: x\nCompleted At: x\nCommand exited with code 2.\n\nCommand output:\nCommand exited with code 0\n';
         const path = writeTranscript(join(dir, 'logs'), [
             line({ step_index: 8, type: 'GENERIC', status: 'DONE', content }),
         ]);
         log(agyPayload(8, { name: 'run_command', args: { CommandLine: 'false' } }, path));
-        log(agyPayload(10, { name: 'view_file', args: {} }, path));
+        log(agyPayload(10, { name: 'read_file', args: {} }, path));
         expect(rows()[0]).toMatchObject({ exit_code: 2, failed: 1, output: content });
     });
 
     test('rows older than a day are no longer filled', () => {
         const logs = join(dir, 'logs');
         const path = writeTranscript(logs, []);
-        log(agyPayload(5, { name: 'view_file', args: {} }, path));
+        log(agyPayload(5, { name: 'read_file', args: {} }, path));
         writeTranscript(logs, AGY_LINES);
-        log(agyPayload(9, { name: 'view_file', args: {} }, path), new Date(NOW.getTime() + 25 * 60 * 60 * 1000));
+        log(agyPayload(9, { name: 'read_file', args: {} }, path), new Date(NOW.getTime() + 25 * 60 * 60 * 1000));
         expect(rows()[0]).toMatchObject({ output: null });
     });
 
@@ -298,7 +309,7 @@ describe('agy', () => {
     });
 
     test('a partial last line is skipped', () => {
-        expect(findAgyStep(`${AGY_LINES.join('\n')}\n{"step_index":5,"type":"VIEW`, 5)?.content).toBe('content of a');
+        expect(findAgyStep(`${AGY_LINES.join('\n')}\n{"step_index":5,"type":"GEN`, 5)?.content).toBe('content of a');
     });
 
     test('readTranscript prefers transcript_full.jsonl and falls back to the given file', () => {
@@ -326,12 +337,36 @@ describe('agy', () => {
         );
         expect(row).toMatchObject({ root: dir, failed: 1, error: 'denied' });
     });
+
+    test('without a workspace folder the call is kept with root <none>', () => {
+        const row = toRow('agy', { toolCall: { name: 'read_file', args: { Path: join(dir, 'a.txt') } } }, {}, NOW);
+        expect(row).toMatchObject({ root: '<none>', tool: 'read', file_path: join(dir, 'a.txt') });
+    });
+
+    test('a multi-root workspace picks the innermost folder that contains the file', () => {
+        const outer = join(dir, 'outer');
+        const inner = join(outer, 'inner');
+        const other = join(dir, 'other');
+        function rootOf(path: string | undefined): unknown {
+            const args = path === undefined ? {} : { Path: path };
+            const payload = { workspacePaths: [other, outer, inner], toolCall: { name: 'edit_file', args } };
+            return toRow('agy', payload, {}, NOW)?.root;
+        }
+        expect(rootOf(join(inner, 'a.ts'))).toBe(normalizeRoot(inner));
+        expect(rootOf(join(outer, 'a.ts'))).toBe(normalizeRoot(outer));
+        // a sibling folder that shares the prefix is not inside the workspace folder
+        expect(rootOf(`${outer}-x${sep}a.ts`)).toBe(normalizeRoot(other));
+        expect(rootOf(undefined)).toBe(normalizeRoot(other));
+        if (process.platform === 'win32') {
+            expect(rootOf(join(inner, 'a.ts').toUpperCase())).toBe(normalizeRoot(inner));
+        }
+    });
 });
 
 describe('helpers', () => {
     test('normalizeTool maps tool names to categories, including both MCP prefixes', () => {
         expect(normalizeTool('PowerShell')).toBe('shell');
-        expect(normalizeTool('multi_replace_file_content')).toBe('edit');
+        expect(normalizeTool('edit_file')).toBe('edit');
         expect(normalizeTool('mcp__github__get_pr')).toBe('mcp');
         expect(normalizeTool('mcp_github_get_pr')).toBe('mcp');
         expect(normalizeTool('ask_question')).toBe('other');
@@ -358,9 +393,8 @@ describe('helpers', () => {
         }
     });
 
-    test('no root means no row', () => {
+    test('a claude call without a root gives no row', () => {
         expect(toRow('claude', { tool_name: 'Bash' }, {}, NOW)).toBeNull();
-        expect(toRow('agy', { toolCall: { name: 'view_file', args: {} } }, {}, NOW)).toBeNull();
     });
 });
 
@@ -380,12 +414,12 @@ describe('database', () => {
 });
 
 describe('fill', () => {
-    // one pending view_file row, logged two days ago, before its result step existed
+    // one pending read_file row, logged two days ago, before its result step existed
     function logOld(): string {
         const logs = join(dir, 'logs');
         const path = writeTranscript(logs, AGY_LINES.slice(0, 2));
         const old = new Date(NOW.getTime() - 48 * 60 * 60 * 1000);
-        const payload = agyPayload(5, { name: 'view_file', args: { AbsolutePath: 'a.txt' } }, path);
+        const payload = agyPayload(5, { name: 'read_file', args: { Path: 'a.txt' } }, path);
         writeRow(toRow('agy', payload, {}, old) as ToolCallRow, old);
         writeTranscript(logs, AGY_LINES);
         return path;
@@ -430,8 +464,9 @@ describe('process', () => {
         return { code: result.exitCode, stdout: result.stdout.toString(), stderr: result.stderr.toString() };
     }
 
-    test('malformed input exits 0 and prints nothing', () => {
+    test('malformed input exits 0, prints nothing and is logged to errors.log', () => {
         expect(run('not json', ['--agent', 'agy'])).toEqual({ code: 0, stdout: '', stderr: '' });
+        expect(readFileSync(join(dir, 'log', 'errors.log'), 'utf8')).toMatch(/^\d{4}-\d\d-\d\dT.*SyntaxError/);
     });
 
     test('eight parallel claude calls on a new database are all logged without any output', async () => {
@@ -462,8 +497,8 @@ describe('process', () => {
 
     test('agy calls are logged and filled without any output', () => {
         const path = writeTranscript(join(dir, 'logs'), AGY_LINES);
-        const first = agyPayload(5, { name: 'view_file', args: { AbsolutePath: 'a.txt' } }, path);
-        const second = agyPayload(6, { name: 'view_file', args: { AbsolutePath: 'b.txt' } }, path);
+        const first = agyPayload(5, { name: 'read_file', args: { Path: 'a.txt' } }, path);
+        const second = agyPayload(6, { name: 'read_file', args: { Path: 'b.txt' } }, path);
         expect(run(JSON.stringify(first), ['--agent', 'agy'])).toEqual({ code: 0, stdout: '', stderr: '' });
         expect(run(JSON.stringify(second), ['--agent', 'agy'])).toEqual({ code: 0, stdout: '', stderr: '' });
         // both results exist in the fixture, so the second call fills both rows

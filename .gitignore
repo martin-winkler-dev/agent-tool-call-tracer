@@ -6,6 +6,10 @@ Desktop.ini
 *.tgz
 *.tar.gz
 
+# Editor
+#.vscode - keep
+.smartin/
+
 # Dependencies
 node_modules/
 package-lock.json

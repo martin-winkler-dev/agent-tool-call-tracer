@@ -1,0 +1,19 @@
+{
+  "version": "0.4.0", // smartin version that wrote this file
+  "eol": "LF",
+  "license": {
+    "copyright": {
+      "name": "Martin Winkler",
+      "year": "2026",
+      "email": false
+    },
+    "spdx": "Apache-2.0",
+    "note": false,
+    "fileHeader": false,
+    "filter": ["*.ts"], // gitignore syntax, "!" excludes
+    "packageBanner": false
+  },
+  "export": {
+    "filter": ["*.ts", "package.json", "tsconfig*.json"] // gitignore syntax, "!" excludes
+  }
+}

@@ -1,6 +1,6 @@
 {
   "name": "agent-tool-call-tracer",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Logs every tool call of Claude Code and Google Antigravity 2.0 (agy) to a local SQLite database.",
   "author": {
     "name": "Martin Winkler"

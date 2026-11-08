@@ -41,7 +41,18 @@ jobs:
         shell: bash
         env:
           NO_COLOR: "1"
-        run: set -o pipefail; bun test --coverage --only-failures 2>&1 | tee coverage.txt
+        # bun exits 1 on a missed coverageThreshold without printing why
+        # sed/cat -s: drop bun's empty per-file ::group:: blocks and blank-line runs
+        run: |
+          set -o pipefail
+          bun test --coverage --only-failures 2>&1 | sed -u '/^::\(end\)\?group::/d' | cat -s | tee coverage.txt || {
+            if grep -qE '^ *0 fail' coverage.txt; then
+              MSG="All tests passed, but a file is below [test.coverageThreshold] in bunfig.toml"
+              echo "$MSG" >> coverage.txt
+              echo "::error title=Coverage threshold::$MSG"
+            fi
+            exit 1
+          }
 
       - name: Create Coverage Summary
         if: always()

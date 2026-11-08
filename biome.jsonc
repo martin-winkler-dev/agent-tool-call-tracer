@@ -9,7 +9,16 @@
   },
   "files": {
     "ignoreUnknown": true,
-    "includes": ["**", "!!**/*.md", "!!**/tests", "!!**/docs", "!!**/old", "!!**/*.old", "!!**/.claude", "!!**/.agents"]
+    "includes": [
+      "**",
+      "!!**/*.md",
+      "!!**/tests/fixtures",
+      "!!**/docs",
+      "!!**/old",
+      "!!**/*.old",
+      "!!**/.claude",
+      "!!**/.agents"
+    ]
   },
   "formatter": {
     "enabled": true,
@@ -101,7 +110,18 @@
             "noExplicitAny": "off"
           },
           "style": {
-            "noNonNullAssertion": "off"
+            "noNonNullAssertion": "off",
+            "useNamingConvention": "off" // test data might mirror external payloads
+          }
+        }
+      }
+    },
+    {
+      "includes": ["**/tests/types/**"],
+      "linter": {
+        "rules": {
+          "correctness": {
+            "noUnusedVariables": "off" // type tests declare variables only to assert their types
           }
         }
       }

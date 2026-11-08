@@ -82,8 +82,8 @@ CREATE TABLE tool_calls (
     subagent_id       TEXT,              -- claude agent_id
     subagent_type     TEXT,              -- claude agent_type | agy agentName
     model             TEXT,              -- agy modelName
-    root              TEXT NOT NULL,     -- repo root, one spelling per repo, e.g. C:\git\repo
-    tool_name         TEXT NOT NULL,     -- raw name: Bash, PowerShell, run_command, mcp__x__y, ...
+    root              TEXT NOT NULL,     -- repo root, one spelling per repo, e.g. C:\git\repo, or '<none>' without a workspace
+    tool_name         TEXT NOT NULL,     -- raw name: Bash, PowerShell, Read, run_command, read_file, edit_file, write_file, mcp__x__y, ...
     tool              TEXT NOT NULL,     -- shell | read | edit | write | grep | glob | web | agent | mcp | other
     command           TEXT,              -- shell command line
     file_path         TEXT,              -- target of a read, edit or write
@@ -95,56 +95,30 @@ CREATE TABLE tool_calls (
     stderr            TEXT,              -- claude Bash
     output_chars      INTEGER,
     input             TEXT NOT NULL,     -- full tool input as JSON
-    extra             TEXT,              -- remaining payload fields as JSON (agy: step_type, step_status)
+    extra             TEXT,              -- remaining payload fields as JSON (claude: bash_response; agy: step_type, step_status)
     UNIQUE (agent, session_id, call_id)
 );
 ```
 
-The database uses WAL mode, so reading it while agents run is safe.
+The database uses WAL mode, so you can read it while agents run.
 
-## Repository layout
+Calls the hook could not log are listed in `errors.log` next to the database.
 
-```text
-agent-tool-call-tracer/
-├── .claude-plugin/
-│   ├── marketplace.json              # Claude Code - marketplace, lists the plugin at ./
-│   └── plugin.json                   # Claude Code - plugin manifest
-├── plugin.json                       # Antigravity - plugin manifest
-├── hooks.json                        # Antigravity - hooks (sync)
-├── hooks/
-│   ├── hooks.json                    # Claude Code - hooks (async)
-│   └── agent-tool-call-tracer.ts     # script
-├── tests/
-│   ├── types/
-│   │   └── agent-tool-call-tracer.test-d.ts
-│   └── unit/
-│       └── agent-tool-call-tracer.test.ts
-├── LICENSE                           # Apache-2.0
-├── package.json                      # dev tooling only
-├── biome.jsonc
-├── bunfig.toml
-└── tsconfig.json
-```
+## Antigravity output arrives one call later
 
-## How the agents differ
-
-- **Claude Code** sends the tool result in the hook payload. A failed call arrives as `PostToolUseFailure`, so the plugin registers both events. Claude reports no exit code; for a failed Bash call the hook parses it from the error text (`Exit code N`). Hook commands resolve paths via `${CLAUDE_PLUGIN_ROOT}`.
-- **Antigravity** waits for the hook and denies the tool on any stdout or a non-zero exit. It writes the tool result to its transcript only after the hook returns, so each AGY row is inserted with `output` NULL and filled by the next AGY tool call, for up to 24 hours. Antigravity has no plugin-root variable; by specification, it sets the hook process working directory to the directory containing `hooks.json` (the plugin root), so relative script paths (`hooks/...`) resolve deterministically.
-
-### Filling missing AGY output
+Antigravity writes a tool's result only after the hook has run. Each AGY row therefore starts with `output` NULL and is filled by the next AGY tool call, for up to 24 hours. Claude Code rows are complete right away.
 
 Before an analysis, fill every pending AGY row, with no age limit:
 
 ```bash
-bun run fill
+bun <plugin folder>/hooks/agent-tool-call-tracer.ts --fill
 ```
 
-`bun run fill` works inside the clone; from anywhere else run `bun <plugin folder>/hooks/agent-tool-call-tracer.ts --fill`, which fills Antigravity rows only, because Claude Code rows are complete when they are inserted.
+Inside a clone of this repository, `bun run fill` does the same.
 
-It prints the rows filled, the rows still pending, and the background tasks without a final result. A command that AGY moves to the background keeps its transcript step at `RUNNING`; such a row gets `step_status = 'BACKGROUND'` in `extra` and the "running as a background task" notice as `output`. If AGY later rewrites the step as `DONE`, the next fill stores the real output.
+It prints the rows filled, the rows still pending, and the background tasks without a final result. A command that AGY runs in the background has `step_status = 'BACKGROUND'` in `extra` and keeps the "running as a background task" notice as `output`.
 
-
-### Example queries
+## Example queries
 
 ```sql
 -- calls per repo and agent
@@ -155,14 +129,6 @@ SELECT agent, tool, count(*) AS calls FROM tool_calls GROUP BY agent, tool ORDER
 
 -- JSON fields
 SELECT id, ts, tool_name, extra ->> '$.step_status' AS status FROM tool_calls WHERE agent = 'agy' ORDER BY id DESC;
-```
-
-## Development
-
-```bash
-bun install
-bun run check      # lint, typecheck, tests
-bun run lint:fix   # Biome safe fixes
 ```
 
 ## License

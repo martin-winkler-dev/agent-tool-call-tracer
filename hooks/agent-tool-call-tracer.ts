@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 import { Database } from 'bun:sqlite';
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // -------------------------------------------------------------------
@@ -49,7 +49,6 @@ export type AgyStep = {
     status?: string;
     content?: string;
     error?: string;
-    exit_code?: number;
 };
 
 /** Subset of tool_calls queried during Antigravity transcript backfill operations. */
@@ -74,8 +73,8 @@ const MATCH_WINDOWS_DRIVE_PREFIX = /^[a-z]:/;
 /** Parses exit code number from Claude Code error messages. */
 const MATCH_CLAUDE_EXIT_CODE = /^Exit code (\d+)/;
 
-/** Parses exit code number from Antigravity generic command step outputs. */
-const MATCH_AGY_GENERIC_EXIT_CODE = /The command exited with code (-?\d+)/;
+/** Parses exit code number from the header line of Antigravity run_command step outputs. */
+const MATCH_AGY_GENERIC_EXIT_CODE = /^Command exited with code (-?\d+)/m;
 
 /** Identifies Antigravity output indicating task handoff to a background process. */
 const MATCH_AGY_BACKGROUND = /^(?:Created At: .*\n)?Tool is running as a background task with task id: /;
@@ -87,22 +86,17 @@ const TOOLS: Record<string, string> = {
     BashOutput: 'shell',
     run_command: 'shell',
     Read: 'read',
-    view_file: 'read',
+    read_file: 'read',
     Edit: 'edit',
     MultiEdit: 'edit',
     NotebookEdit: 'edit',
-    replace_file_content: 'edit',
-    multi_replace_file_content: 'edit',
+    edit_file: 'edit',
     Write: 'write',
-    write_to_file: 'write',
+    write_file: 'write',
     Grep: 'grep',
-    grep_search: 'grep',
     Glob: 'glob',
-    find_by_name: 'glob',
-    list_dir: 'glob',
     WebFetch: 'web',
     WebSearch: 'web',
-    read_url_content: 'web',
     search_web: 'web',
     Agent: 'agent',
     Task: 'agent',
@@ -122,6 +116,9 @@ const CLAUDE_MAPPED = [
     'error',
     'is_interrupt',
 ] as const;
+
+/** Claude Code Bash response properties mapped directly to columns; the rest is kept as bash_response in extra JSON. */
+const BASH_MAPPED = ['stdout', 'stderr', 'interrupted'] as const;
 
 /** Antigravity payload properties mapped directly to columns and excluded from extra JSON. */
 const AGY_MAPPED = [
@@ -249,6 +246,7 @@ export function fromClaude(payload: Json, env: Record<string, string | undefined
     let output: string | null = null;
     let stderr: string | null = null;
     let interrupted: 0 | 1 | null = payload.is_interrupt === true ? 1 : null;
+    let extraSource = payload;
     if (typeof response === 'string') {
         output = response;
     } else if (response !== undefined && response !== null) {
@@ -257,6 +255,10 @@ export function fromClaude(payload: Json, env: Record<string, string | undefined
             output = fields.stdout;
             stderr = str(fields.stderr);
             interrupted = fields.interrupted === true ? 1 : 0;
+            const rest = without(fields, BASH_MAPPED);
+            if (Object.keys(rest).length > 0) {
+                extraSource = { ...payload, bash_response: rest };
+            }
         } else {
             output = JSON.stringify(response);
         }
@@ -285,7 +287,7 @@ export function fromClaude(payload: Json, env: Record<string, string | undefined
         stderr,
         output_chars: output?.length ?? null,
         input: JSON.stringify(input),
-        extra: omit(payload, CLAUDE_MAPPED),
+        extra: omit(extraSource, CLAUDE_MAPPED),
     };
 }
 
@@ -336,19 +338,15 @@ export function findAgyStep(text: string, stepIdx: number): AgyStep | null {
 /**
  * **Parses Antigravity hook payload into initial pending row**.
  *
- * - extracts workspace paths and command line arguments
+ * - picks the workspace folder containing the target file, or '<none>' without a workspace
+ * - extracts command line and target file arguments
  * - sets output to null pending subsequent transcript completion
- *
- * @returns Normalized row, or null if workspace root cannot be determined.
  */
-export function fromAgy(payload: Json, now: Date): ToolCallRow | null {
+export function fromAgy(payload: Json, now: Date): ToolCallRow {
     const call = obj(payload.toolCall);
     const args = obj(call.args);
-    const workspaces = Array.isArray(payload.workspacePaths) ? payload.workspacePaths : [];
-    const root = toPath(workspaces[0]) ?? str(args.Cwd);
-    if (root === null) {
-        return null;
-    }
+    const workspaces: unknown[] = Array.isArray(payload.workspacePaths) ? payload.workspacePaths : [];
+    const filePath = toPath(args.Path);
     const toolName = str(call.name) ?? 'unknown';
     const error = str(payload.error);
     return {
@@ -361,11 +359,11 @@ export function fromAgy(payload: Json, now: Date): ToolCallRow | null {
         subagent_id: null,
         subagent_type: str(payload.agentName),
         model: str(payload.modelName),
-        root: normalizeRoot(root),
+        root: pickRoot(workspaces, filePath) ?? '<none>',
         tool_name: toolName,
         tool: normalizeTool(toolName),
         command: str(args.CommandLine),
-        file_path: toPath(args.TargetFile) ?? toPath(args.AbsolutePath),
+        file_path: filePath,
         failed: error === null ? 0 : 1,
         error,
         exit_code: null,
@@ -404,11 +402,14 @@ export function toRow(
  * - reads transcript files outside the write transaction to prevent lock contention
  * - extracts exit codes and execution failure indicators from completed steps
  * - updates pending records within an immediate database transaction
+ * - skips BACKGROUND rows on the live hook path (since set), because AGY never rewrites their step
  */
 export function backfillAgy(db: Database, since: string | null): number {
+    const filter =
+        since !== null ? `${AGY_PENDING} AND json_extract(extra, '$.step_status') IS NOT 'BACKGROUND'` : AGY_PENDING;
     const pending = db
         .query(
-            `SELECT id, call_id, tool_name, error, extra FROM tool_calls INDEXED BY tool_calls_agy_pending WHERE ${AGY_PENDING} AND ts >= ?`,
+            `SELECT id, call_id, tool_name, error, extra FROM tool_calls INDEXED BY tool_calls_agy_pending WHERE ${filter} AND ts >= ?`,
         )
         .all(since ?? '') as PendingRow[];
     const transcripts = new Map<string, string | null>();
@@ -514,17 +515,21 @@ function obj(value: unknown): Json {
     return typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Json) : {};
 }
 
-/** Serializes remaining properties to JSON string omitting matched exclusion keys. */
-function omit(payload: Json, keys: readonly string[]): string | null {
+/** Copies record properties omitting matched exclusion keys. */
+function without(payload: Json, keys: readonly string[]): Json {
     const rest: Json = {};
-    let count = 0;
     for (const key of Object.keys(payload)) {
         if (!keys.includes(key)) {
             rest[key] = payload[key];
-            count++;
         }
     }
-    return count > 0 ? JSON.stringify(rest) : null;
+    return rest;
+}
+
+/** Serializes remaining properties to JSON string omitting matched exclusion keys. */
+function omit(payload: Json, keys: readonly string[]): string | null {
+    const rest = without(payload, keys);
+    return Object.keys(rest).length > 0 ? JSON.stringify(rest) : null;
 }
 
 /** Converts file URI strings or filesystem paths to native filesystem path. */
@@ -540,11 +545,43 @@ function toPath(value: unknown): string | null {
     }
 }
 
-/** Extracts numeric process exit code from step property or command console output. */
-function agyExitCode(step: AgyStep, toolName: string): number | null {
-    if (typeof step.exit_code === 'number') {
-        return step.exit_code;
+/**
+ * **Picks the workspace folder that contains the target file**.
+ *
+ * - compares case-insensitively on Windows and on a path separator boundary
+ * - prefers the longest match, so nested workspace folders resolve to the innermost one
+ *
+ * @returns Normalized workspace root, the first workspace without a match, or null without workspaces.
+ */
+function pickRoot(workspaces: unknown[], filePath: string | null): string | null {
+    const roots = workspaces
+        .map(toPath)
+        .filter((path): path is string => path !== null)
+        .map(normalizeRoot);
+    if (filePath !== null && roots.length > 1) {
+        const target = foldCase(normalizeRoot(filePath));
+        let best: string | null = null;
+        for (const root of roots) {
+            const folded = foldCase(root);
+            const prefix = folded.endsWith(sep) ? folded : `${folded}${sep}`;
+            if ((target === folded || target.startsWith(prefix)) && (best === null || root.length > best.length)) {
+                best = root;
+            }
+        }
+        if (best !== null) {
+            return best;
+        }
     }
+    return roots[0] ?? null;
+}
+
+/** Lowercases paths on Windows, where the file system ignores case. */
+function foldCase(path: string): string {
+    return process.platform === 'win32' ? path.toLowerCase() : path;
+}
+
+/** Extracts numeric process exit code from command console output. */
+function agyExitCode(step: AgyStep, toolName: string): number | null {
     const match = toolName === 'run_command' ? step.content?.match(MATCH_AGY_GENERIC_EXIT_CODE) : null;
     return match ? Number(match[1]) : null;
 }
@@ -611,6 +648,14 @@ if (import.meta.main && process.argv.includes('--fill')) {
 } else if (import.meta.main) {
     try {
         await main();
-    } catch {}
+    } catch (error) {
+        // stdout, stderr and the exit code stay clean, because hook runners treat any of them as a hook error
+        try {
+            const errors = join(dirname(logFile(process.env)), 'errors.log');
+            mkdirSync(dirname(errors), { recursive: true });
+            const text = error instanceof Error ? (error.stack ?? error.message) : String(error);
+            appendFileSync(errors, `${new Date().toISOString()} ${text}\n`);
+        } catch {}
+    }
     process.exit(0);
 }

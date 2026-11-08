@@ -1,6 +1,6 @@
 {
   "name": "agent-tool-call-tracer",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Logs every tool call of Claude Code and Google Antigravity to a local SQLite database.",
   "keywords": [
     "agent",
@@ -41,6 +41,8 @@
     "@biomejs/biome": "2.5.14",
     "@types/bun": "^1.4.0",
     "@types/node": "^22.12.0",
+    "bun-test-runner": "latest",
+    "smartin": "latest",
     "typescript": "^7.0.2"
   }
 }
