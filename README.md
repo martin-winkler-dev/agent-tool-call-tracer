@@ -11,7 +11,7 @@ that logs every agent's tool call into a local SQLite database.
 
 - **Pass-through:** the hook never changes any tool call.
 - **Requirement:** written in TypeScript and requires `bun` 1.3 or later on the `PATH`.
-- **Database:** `~/.agent-tool-call-tracer/log.sqlite`; (`AGENT_LOG_DB` environment variable overrides this)
+- **Database:** `~/.agent-tool-call-tracer/log.sqlite` (`AGENT_LOG_DB` overrides this; relative paths resolve from `~`)
 - **Sensitive data:** the database stores the raw tool inputs and outputs, so it can contain secrets such as tokens, passwords and file contents.
 
 ## How to Install
@@ -81,7 +81,7 @@ CREATE TABLE tool_calls (
     parent_session_id TEXT,              -- agy parentConversationId
     subagent_id       TEXT,              -- claude agent_id
     subagent_type     TEXT,              -- claude agent_type | agy agentName
-    model             TEXT,              -- agy modelName
+    model             TEXT,              -- claude transcript model (filled on Stop/SubagentStop) | agy modelName
     root              TEXT NOT NULL,     -- repo root, one spelling per repo, e.g. C:\git\repo, or '<none>' without a workspace
     tool_name         TEXT NOT NULL,     -- raw name: Bash, PowerShell, Read, run_command, read_file, edit_file, write_file, mcp__x__y, ...
     tool              TEXT NOT NULL,     -- shell | read | edit | write | grep | glob | web | agent | mcp | other
@@ -104,11 +104,12 @@ The database uses WAL mode, so you can read it while agents run.
 
 Calls the hook could not log are listed in `errors.log` next to the database.
 
-## Antigravity output arrives one call later
+## Backfilling deferred fields
 
-Antigravity writes a tool's result only after the hook has run. Each AGY row therefore starts with `output` NULL and is filled by the next AGY tool call, for up to 24 hours. Claude Code rows are complete right away.
+- **Antigravity:** AGY writes a tool's result only after the hook has run. Each AGY row therefore starts with `output` NULL and is filled by the next AGY tool call in that conversation or its parent/subagent conversations (for up to 24 hours, scanning the recent transcript tail).
+- **Claude Code:** `PostToolUse` payloads do not include the model name. Each Claude Code row starts with `model` NULL and is filled from the session or subagent transcript when `Stop`, `SubagentStop`, or `SessionEnd` fires (note: Claude Code caps `SessionEnd` hooks via `CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS`, ~1.5 s by default).
 
-Before an analysis, fill every pending AGY row, with no age limit:
+Before an analysis, fill every pending AGY and Claude Code row, with no age limit:
 
 ```bash
 bun <plugin folder>/hooks/agent-tool-call-tracer.ts --fill

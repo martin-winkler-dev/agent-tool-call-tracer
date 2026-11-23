@@ -5,12 +5,15 @@ import { homedir, tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
+    claudeTranscriptPath,
     detectAgent,
     fillLog,
     findAgyStep,
+    handleClaudeStop,
     logFile,
     normalizeRoot,
     normalizeTool,
+    parseClaudeModels,
     readTranscript,
     type ToolCallRow,
     toRow,
@@ -115,6 +118,7 @@ describe('claude', () => {
             tool: 'shell',
             command: 'bun test',
             failed: 0,
+            exit_code: 0,
             output: 'ok',
             stderr: 'warn',
             interrupted: 0,
@@ -126,6 +130,77 @@ describe('claude', () => {
             permission_mode: 'default',
             bash_response: { isImage: false },
         });
+    });
+
+    test('interrupted, backgrounded and BashOutput shell calls leave exit_code null', () => {
+        const interrupted = toRow(
+            'claude',
+            {
+                session_id: 's1',
+                tool_use_id: 't1',
+                cwd: dir,
+                hook_event_name: 'PostToolUse',
+                tool_name: 'Bash',
+                tool_input: { command: 'sleep 99' },
+                tool_response: { stdout: '', stderr: '', interrupted: true },
+            },
+            {},
+            NOW,
+        );
+        expect(interrupted).toMatchObject({ failed: 0, interrupted: 1, exit_code: null });
+
+        const backgrounded = toRow(
+            'claude',
+            {
+                session_id: 's1',
+                tool_use_id: 't2',
+                cwd: dir,
+                hook_event_name: 'PostToolUse',
+                tool_name: 'Bash',
+                tool_input: { command: 'bun dev', run_in_background: true },
+                tool_response: { stdout: 'started', stderr: '', interrupted: false, backgroundTaskId: 'bg1' },
+            },
+            {},
+            NOW,
+        );
+        expect(backgrounded).toMatchObject({ failed: 0, interrupted: 0, exit_code: null });
+
+        const bashOutput = toRow(
+            'claude',
+            {
+                session_id: 's1',
+                tool_use_id: 't3',
+                cwd: dir,
+                hook_event_name: 'PostToolUse',
+                tool_name: 'BashOutput',
+                tool_input: { bash_id: 'bg1' },
+                tool_response: { stdout: 'line', stderr: '', interrupted: false },
+            },
+            {},
+            NOW,
+        );
+        expect(bashOutput).toMatchObject({ tool: 'shell', failed: 0, exit_code: null });
+
+        const nonZeroSuccess = toRow(
+            'claude',
+            {
+                session_id: 's1',
+                tool_use_id: 't4',
+                cwd: dir,
+                hook_event_name: 'PostToolUse',
+                tool_name: 'Bash',
+                tool_input: { command: 'grep missing a.txt' },
+                tool_response: {
+                    stdout: '',
+                    stderr: '',
+                    interrupted: false,
+                    returnCodeInterpretation: 'No matches found',
+                },
+            },
+            {},
+            NOW,
+        );
+        expect(nonZeroSuccess).toMatchObject({ failed: 0, interrupted: 0, exit_code: null });
     });
 
     test('PostToolUseFailure sets failed, error and the exit code from the error text', () => {
@@ -211,6 +286,334 @@ describe('claude', () => {
             expect(row).toMatchObject({ failed: 0, error: null });
         }
     });
+
+    test('parseClaudeModels maps tool_use ids to assistant models and skips partial lines', () => {
+        const text = [
+            line({ type: 'user', message: { role: 'user', content: 'hi' } }),
+            line({
+                type: 'assistant',
+                message: {
+                    role: 'assistant',
+                    model: 'claude-fable-5-2',
+                    content: [
+                        { type: 'text', text: 'checking' },
+                        { type: 'tool_use', id: 'toolu_1', name: 'Read' },
+                        { type: 'tool_use', id: 'toolu_2', name: 'Bash' },
+                    ],
+                },
+            }),
+            '{"type":"assistant","message":{"model":"claude-haiku-5-5","content":[{"type":"tool_use","id":"toolu_cut',
+        ].join('\n');
+        expect(parseClaudeModels(text)).toEqual(
+            new Map([
+                ['toolu_1', 'claude-fable-5-2'],
+                ['toolu_2', 'claude-fable-5-2'],
+            ]),
+        );
+    });
+
+    test('claudeTranscriptPath resolves main, direct subagent, nested subagent and flat subagent paths', () => {
+        const projectDir = join(dir, 'project');
+        const mainPath = join(projectDir, 'sess-1.jsonl');
+        const nestedPath = join(projectDir, 'sess-1', 'subagents', 'agent-a1.jsonl');
+        const flatPath = join(projectDir, 'agent-a2.jsonl');
+        mkdirSync(join(projectDir, 'sess-1', 'subagents'), { recursive: true });
+        writeFileSync(nestedPath, '');
+        writeFileSync(flatPath, '');
+
+        expect(claudeTranscriptPath(mainPath, 'sess-1', null)).toBe(mainPath);
+        expect(claudeTranscriptPath(nestedPath, 'sess-1', 'a1')).toBe(nestedPath);
+        expect(claudeTranscriptPath(mainPath, 'sess-1', 'a1')).toBe(nestedPath);
+        expect(claudeTranscriptPath(mainPath, 'sess-1', 'a2')).toBe(flatPath);
+    });
+
+    test('SubagentStop stays scoped to its subagent while Stop and SessionEnd backfill the whole session', () => {
+        const projectDir = join(dir, 'claude-proj');
+        const mainPath = join(projectDir, 'sess-1.jsonl');
+        const sub1Path = join(projectDir, 'sess-1', 'subagents', 'agent-sub1.jsonl');
+        const sub2Path = join(projectDir, 'sess-1', 'subagents', 'agent-sub2.jsonl');
+        mkdirSync(join(projectDir, 'sess-1', 'subagents'), { recursive: true });
+        writeFileSync(
+            mainPath,
+            `${line({
+                type: 'assistant',
+                message: { model: 'claude-opus-5-5', content: [{ type: 'tool_use', id: 'toolu_main' }] },
+            })}\n`,
+        );
+        writeFileSync(
+            sub1Path,
+            `${line({
+                type: 'assistant',
+                message: { model: 'claude-haiku-5-5', content: [{ type: 'tool_use', id: 'toolu_sub1' }] },
+            })}\n`,
+        );
+        writeFileSync(
+            sub2Path,
+            `${line({
+                type: 'assistant',
+                message: { model: 'claude-sonnet-5-5', content: [{ type: 'tool_use', id: 'toolu_sub2' }] },
+            })}\n`,
+        );
+
+        writeRow(
+            toRow(
+                'claude',
+                {
+                    session_id: 'sess-1',
+                    tool_use_id: 'toolu_main',
+                    cwd: dir,
+                    tool_name: 'Read',
+                    transcript_path: mainPath,
+                },
+                {},
+                NOW,
+            ) as ToolCallRow,
+        );
+        writeRow(
+            toRow(
+                'claude',
+                {
+                    session_id: 'sess-1',
+                    tool_use_id: 'toolu_sub1',
+                    agent_id: 'sub1',
+                    agent_type: 'general-purpose',
+                    cwd: dir,
+                    tool_name: 'Bash',
+                    transcript_path: mainPath,
+                },
+                {},
+                NOW,
+            ) as ToolCallRow,
+        );
+        writeRow(
+            toRow(
+                'claude',
+                {
+                    session_id: 'sess-1',
+                    tool_use_id: 'toolu_sub2',
+                    agent_id: 'sub2',
+                    agent_type: 'Explore',
+                    cwd: dir,
+                    tool_name: 'Grep',
+                    transcript_path: mainPath,
+                },
+                {},
+                NOW,
+            ) as ToolCallRow,
+        );
+
+        expect(
+            handleClaudeStop({
+                hook_event_name: 'SubagentStop',
+                session_id: 'sess-1',
+                agent_id: 'sub1',
+                agent_transcript_path: sub1Path,
+            }),
+        ).toBe(1);
+        expect(rows()).toMatchObject([
+            { call_id: 'toolu_main', model: null },
+            { call_id: 'toolu_sub1', model: 'claude-haiku-5-5' },
+            { call_id: 'toolu_sub2', model: null },
+        ]);
+
+        // main Stop catches both main rows and orphaned subagent rows whose SubagentStop did not fire
+        expect(handleClaudeStop({ hook_event_name: 'Stop', session_id: 'sess-1', transcript_path: mainPath })).toBe(2);
+        expect(rows()).toMatchObject([
+            { call_id: 'toolu_main', model: 'claude-opus-5-5' },
+            { call_id: 'toolu_sub1', model: 'claude-haiku-5-5' },
+            { call_id: 'toolu_sub2', model: 'claude-sonnet-5-5' },
+        ]);
+    });
+
+    test('chunked backward transcript reader resolves models across 256 KB boundaries with multi-byte UTF-8', () => {
+        const mainPath = join(dir, 'large-claude.jsonl');
+        const filler = 'äöüß🚀'.repeat(60_000);
+        writeFileSync(
+            mainPath,
+            `${[
+                line({
+                    type: 'assistant',
+                    message: { model: 'claude-old-5-0', content: [{ type: 'tool_use', id: 'toolu_early' }] },
+                }),
+                line({ type: 'user', message: { role: 'user', content: filler } }),
+                line({
+                    type: 'assistant',
+                    message: { model: 'claude-new-5-5', content: [{ type: 'tool_use', id: 'toolu_tail' }] },
+                }),
+            ].join('\n')}\n`,
+        );
+        writeRow(
+            toRow(
+                'claude',
+                {
+                    session_id: 'sess-big',
+                    tool_use_id: 'toolu_early',
+                    cwd: dir,
+                    tool_name: 'Read',
+                    transcript_path: mainPath,
+                },
+                {},
+                NOW,
+            ) as ToolCallRow,
+        );
+        writeRow(
+            toRow(
+                'claude',
+                {
+                    session_id: 'sess-big',
+                    tool_use_id: 'toolu_tail',
+                    cwd: dir,
+                    tool_name: 'Read',
+                    transcript_path: mainPath,
+                },
+                {},
+                NOW,
+            ) as ToolCallRow,
+        );
+        expect(
+            handleClaudeStop({ hook_event_name: 'SessionEnd', session_id: 'sess-big', transcript_path: mainPath }),
+        ).toBe(2);
+        expect(rows()).toMatchObject([
+            { call_id: 'toolu_early', model: 'claude-old-5-0' },
+            { call_id: 'toolu_tail', model: 'claude-new-5-5' },
+        ]);
+    });
+
+    test('unresolvable Claude rows are marked model_missing and excluded from future scans', () => {
+        const mainPath = join(dir, 'claude-missing.jsonl');
+        writeFileSync(
+            mainPath,
+            `${line({
+                type: 'assistant',
+                message: { model: 'claude-sonnet-5-5', content: [{ type: 'tool_use', id: 'toolu_present' }] },
+            })}\n`,
+        );
+        writeRow(
+            toRow(
+                'claude',
+                {
+                    session_id: 'sess-m',
+                    tool_use_id: 'toolu_present',
+                    cwd: dir,
+                    tool_name: 'Read',
+                    transcript_path: mainPath,
+                },
+                {},
+                NOW,
+            ) as ToolCallRow,
+        );
+        // absent from the existing transcript (e.g. randomUUID fallback)
+        writeRow(
+            toRow(
+                'claude',
+                { session_id: 'sess-m', cwd: dir, tool_name: 'Read', transcript_path: mainPath },
+                {},
+                NOW,
+            ) as ToolCallRow,
+        );
+        // no transcript_path recorded at all
+        writeRow(
+            toRow(
+                'claude',
+                { session_id: 'sess-no-path', tool_use_id: 'toolu_nopath', cwd: dir, tool_name: 'Read' },
+                {},
+                NOW,
+            ) as ToolCallRow,
+        );
+        // stale row whose transcript file was deleted (>24h ago)
+        const oldTs = new Date(Date.now() - 48 * 60 * 60 * 1000);
+        writeRow(
+            toRow(
+                'claude',
+                {
+                    session_id: 'sess-deleted',
+                    tool_use_id: 'toolu_deleted',
+                    cwd: dir,
+                    tool_name: 'Read',
+                    transcript_path: join(dir, 'deleted.jsonl'),
+                },
+                {},
+                oldTs,
+            ) as ToolCallRow,
+        );
+
+        expect(handleClaudeStop({ hook_event_name: 'Stop', session_id: 'sess-m', transcript_path: mainPath })).toBe(1);
+        expect(fillLog()).toEqual({ filled: 0, pending: 0, background: 0 });
+        expect(
+            rows().map((r) => ({ model: r.model, missing: JSON.parse(String(r.extra ?? '{}')).model_missing })),
+        ).toEqual([
+            { model: 'claude-sonnet-5-5', missing: undefined },
+            { model: null, missing: 1 },
+            { model: null, missing: 1 },
+            { model: null, missing: 1 },
+        ]);
+    });
+
+    test('fresh Claude rows survive empty or unflushed transcripts on live Stop and fill once flushed', () => {
+        const emptyPath = join(dir, 'claude-empty.jsonl');
+        const lagPath = join(dir, 'claude-lag.jsonl');
+        writeFileSync(emptyPath, '');
+        writeFileSync(lagPath, `${line({ type: 'user', message: { role: 'user', content: 'hi' } })}\n`);
+        const fresh = new Date();
+        writeRow(
+            toRow(
+                'claude',
+                {
+                    session_id: 'sess-empty',
+                    tool_use_id: 'toolu_e1',
+                    cwd: dir,
+                    tool_name: 'Read',
+                    transcript_path: emptyPath,
+                },
+                {},
+                fresh,
+            ) as ToolCallRow,
+        );
+        writeRow(
+            toRow(
+                'claude',
+                {
+                    session_id: 'sess-lag',
+                    tool_use_id: 'toolu_l1',
+                    cwd: dir,
+                    tool_name: 'Read',
+                    transcript_path: lagPath,
+                },
+                {},
+                fresh,
+            ) as ToolCallRow,
+        );
+
+        // live Stop misses both, but neither should be permanently locked out
+        expect(
+            handleClaudeStop({ hook_event_name: 'Stop', session_id: 'sess-empty', transcript_path: emptyPath }),
+        ).toBe(0);
+        expect(handleClaudeStop({ hook_event_name: 'Stop', session_id: 'sess-lag', transcript_path: lagPath })).toBe(0);
+
+        writeFileSync(
+            emptyPath,
+            `${line({
+                type: 'assistant',
+                message: { model: 'claude-opus-5-5', content: [{ type: 'tool_use', id: 'toolu_e1' }] },
+            })}\n`,
+        );
+        writeFileSync(
+            lagPath,
+            `${line({
+                type: 'assistant',
+                message: { model: 'claude-haiku-5-5', content: [{ type: 'tool_use', id: 'toolu_l1' }] },
+            })}\n`,
+        );
+
+        expect(
+            handleClaudeStop({ hook_event_name: 'Stop', session_id: 'sess-empty', transcript_path: emptyPath }),
+        ).toBe(1);
+        expect(handleClaudeStop({ hook_event_name: 'Stop', session_id: 'sess-lag', transcript_path: lagPath })).toBe(1);
+        expect(rows()).toMatchObject([
+            { call_id: 'toolu_e1', model: 'claude-opus-5-5' },
+            { call_id: 'toolu_l1', model: 'claude-haiku-5-5' },
+        ]);
+    });
 });
 
 describe('agy', () => {
@@ -219,7 +622,7 @@ describe('agy', () => {
     }
 
     test('the hook inserts the call without output, because AGY writes the result step afterwards', () => {
-        const path = writeTranscript(join(dir, 'logs'), AGY_LINES.slice(0, 2));
+        const path = writeTranscript(join(dir, 'logs'), AGY_LINES);
         log(agyPayload(5, { name: 'read_file', args: { Path: 'a.txt' } }, path));
         expect(rows()).toMatchObject([
             {
@@ -233,6 +636,83 @@ describe('agy', () => {
                 error: null,
                 output: null,
             },
+        ]);
+    });
+
+    test('chunked backward reader resolves AGY steps across 256 KB boundaries', () => {
+        const logs = join(dir, 'logs-big');
+        const filler = 'x'.repeat(600_000);
+        const path = writeTranscript(logs, [
+            line({ step_index: 1, type: 'GENERIC', status: 'DONE', content: 'early-step' }),
+            line({ step_index: 2, type: 'GENERIC', status: 'DONE', content: filler }),
+            line({ step_index: 3, type: 'GENERIC', status: 'DONE', content: 'tail-step' }),
+        ]);
+        log(agyPayload(1, { name: 'read_file', args: { Path: 'a.txt' } }, path));
+        log(agyPayload(3, { name: 'read_file', args: { Path: 'b.txt' } }, path));
+        log(agyPayload(4, { name: 'read_file', args: { Path: 'c.txt' } }, path));
+        expect(rows()).toMatchObject([
+            { call_id: '1', output: 'early-step' },
+            { call_id: '3', output: 'tail-step' },
+            { call_id: '4', output: null },
+        ]);
+    });
+
+    test('live AGY backfill is scoped to the current conversation and capped at 2 MB while fillLog fills all', () => {
+        const logsA = join(dir, 'logs-a');
+        const pathA = writeTranscript(logsA, [
+            line({ step_index: 1, type: 'GENERIC', status: 'DONE', content: 'from-conv-a' }),
+        ]);
+        const logsB = join(dir, 'logs-b');
+        const huge = 'y'.repeat(2_200_000);
+        const pathB = writeTranscript(logsB, [
+            line({ step_index: 1, type: 'GENERIC', status: 'DONE', content: 'beyond-2mb' }),
+            line({ step_index: 2, type: 'GENERIC', status: 'DONE', content: huge }),
+            line({ step_index: 3, type: 'GENERIC', status: 'DONE', content: 'recent-b' }),
+        ]);
+        log({ ...agyPayload(1, { name: 'read_file', args: {} }, pathA), conversationId: 'conv-a' });
+        log({ ...agyPayload(1, { name: 'read_file', args: {} }, pathB), conversationId: 'conv-b' });
+        log({ ...agyPayload(3, { name: 'read_file', args: {} }, pathB), conversationId: 'conv-b' });
+        log({ ...agyPayload(4, { name: 'read_file', args: {} }, pathB), conversationId: 'conv-b' });
+        // conv-a was not touched by conv-b; conv-b step 1 is >2 MB back so live hook skipped it
+        expect(rows()).toMatchObject([
+            { session_id: 'conv-a', call_id: '1', output: null },
+            { session_id: 'conv-b', call_id: '1', output: null },
+            { session_id: 'conv-b', call_id: '3', output: 'recent-b' },
+            { session_id: 'conv-b', call_id: '4', output: null },
+        ]);
+        expect(fillLog()).toEqual({ filled: 2, pending: 1, background: 0 });
+        expect(rows()).toMatchObject([
+            { session_id: 'conv-a', call_id: '1', output: 'from-conv-a' },
+            { session_id: 'conv-b', call_id: '1', output: 'beyond-2mb' },
+            { session_id: 'conv-b', call_id: '3', output: 'recent-b' },
+            { session_id: 'conv-b', call_id: '4', output: null },
+        ]);
+    });
+
+    test('live AGY backfill also fills parent and subagent conversations across handoffs', () => {
+        const parentPath = writeTranscript(join(dir, 'logs-parent'), [
+            line({ step_index: 1, type: 'GENERIC', status: 'DONE', content: 'spawned-subagent' }),
+        ]);
+        const childPath = writeTranscript(join(dir, 'logs-child'), [
+            line({ step_index: 1, type: 'GENERIC', status: 'DONE', content: 'child-final-step' }),
+        ]);
+        // parent spawns subagent -> subagent's first tool call fills parent's pending call
+        log({ ...agyPayload(1, { name: 'invoke_subagent', args: {} }, parentPath), conversationId: 'parent-1' });
+        log({
+            ...agyPayload(1, { name: 'read_file', args: {} }, childPath),
+            conversationId: 'child-1',
+            parentConversationId: 'parent-1',
+        });
+        expect(rows()).toMatchObject([
+            { session_id: 'parent-1', call_id: '1', output: 'spawned-subagent' },
+            { session_id: 'child-1', call_id: '1', output: null },
+        ]);
+        // subagent finishes -> parent's next tool call fills subagent's final call
+        log({ ...agyPayload(2, { name: 'read_file', args: {} }, parentPath), conversationId: 'parent-1' });
+        expect(rows()).toMatchObject([
+            { session_id: 'parent-1', call_id: '1', output: 'spawned-subagent' },
+            { session_id: 'child-1', call_id: '1', output: 'child-final-step' },
+            { session_id: 'parent-1', call_id: '2', output: null },
         ]);
     });
 
@@ -378,9 +858,10 @@ describe('helpers', () => {
         expect(detectAgent([], { session_id: 's' })).toBe('claude');
     });
 
-    test('logFile defaults to the home folder', () => {
+    test('logFile defaults to the home folder and resolves relative paths from home', () => {
         expect(logFile({})).toBe(join(homedir(), '.agent-tool-call-tracer', 'log.sqlite'));
         expect(logFile({ AGENT_LOG_DB: file })).toBe(file);
+        expect(logFile({ AGENT_LOG_DB: 'logs/custom.sqlite' })).toBe(join(homedir(), 'logs', 'custom.sqlite'));
     });
 
     test('normalizeRoot gives one spelling per repo', () => {
@@ -453,6 +934,56 @@ describe('fill', () => {
         expect(filled.sort()).toEqual([0, 1]);
         expect(rows()).toMatchObject([{ call_id: '5', output: 'content of a' }]);
     });
+
+    test('fillLog also backfills Claude Code models for main and subagent rows', () => {
+        const projectDir = join(dir, 'claude-fill');
+        const mainPath = join(projectDir, 's1.jsonl');
+        const subPath = join(projectDir, 's1', 'subagents', 'agent-a1.jsonl');
+        mkdirSync(join(projectDir, 's1', 'subagents'), { recursive: true });
+        writeFileSync(
+            mainPath,
+            `${line({
+                type: 'assistant',
+                message: { model: 'claude-sonnet-5-5', content: [{ type: 'tool_use', id: 'toolu_m' }] },
+            })}\n`,
+        );
+        writeFileSync(
+            subPath,
+            `${line({
+                type: 'assistant',
+                message: { model: 'claude-haiku-5-5', content: [{ type: 'tool_use', id: 'toolu_s' }] },
+            })}\n`,
+        );
+        writeRow(
+            toRow(
+                'claude',
+                { session_id: 's1', tool_use_id: 'toolu_m', cwd: dir, tool_name: 'Read', transcript_path: mainPath },
+                {},
+                NOW,
+            ) as ToolCallRow,
+        );
+        writeRow(
+            toRow(
+                'claude',
+                {
+                    session_id: 's1',
+                    tool_use_id: 'toolu_s',
+                    agent_id: 'a1',
+                    cwd: dir,
+                    tool_name: 'Bash',
+                    transcript_path: mainPath,
+                },
+                {},
+                NOW,
+            ) as ToolCallRow,
+        );
+
+        expect(fillLog()).toEqual({ filled: 2, pending: 0, background: 0 });
+        expect(rows()).toMatchObject([
+            { call_id: 'toolu_m', model: 'claude-sonnet-5-5' },
+            { call_id: 'toolu_s', model: 'claude-haiku-5-5' },
+        ]);
+    });
 });
 
 describe('process', () => {
@@ -501,10 +1032,39 @@ describe('process', () => {
         const second = agyPayload(6, { name: 'read_file', args: { Path: 'b.txt' } }, path);
         expect(run(JSON.stringify(first), ['--agent', 'agy'])).toEqual({ code: 0, stdout: '', stderr: '' });
         expect(run(JSON.stringify(second), ['--agent', 'agy'])).toEqual({ code: 0, stdout: '', stderr: '' });
-        // both results exist in the fixture, so the second call fills both rows
+        // the second call fills the earlier pending call and skips itself
         expect(rows()).toMatchObject([
             { agent: 'agy', call_id: '5', output: 'content of a' },
-            { agent: 'agy', call_id: '6', output: 'content of b' },
+            { agent: 'agy', call_id: '6', output: null },
         ]);
+    });
+
+    test('claude Stop hook fills models without inserting a row or printing output', () => {
+        const transcriptPath = join(dir, 'sess-stop.jsonl');
+        writeFileSync(
+            transcriptPath,
+            `${line({
+                type: 'assistant',
+                message: { model: 'claude-fable-5-2', content: [{ type: 'tool_use', id: 'toolu_9' }] },
+            })}\n`,
+        );
+        const toolPayload = {
+            session_id: 'sess-stop',
+            tool_use_id: 'toolu_9',
+            cwd: dir,
+            hook_event_name: 'PostToolUse',
+            tool_name: 'Read',
+            transcript_path: transcriptPath,
+        };
+        const stopPayload = {
+            session_id: 'sess-stop',
+            hook_event_name: 'Stop',
+            transcript_path: transcriptPath,
+        };
+        expect(run(JSON.stringify(toolPayload), ['--agent', 'claude'])).toEqual({ code: 0, stdout: '', stderr: '' });
+        expect(rows()).toMatchObject([{ call_id: 'toolu_9', model: null }]);
+        expect(run(JSON.stringify(stopPayload), ['--agent', 'claude'])).toEqual({ code: 0, stdout: '', stderr: '' });
+        expect(rows()).toHaveLength(1);
+        expect(rows()).toMatchObject([{ call_id: 'toolu_9', model: 'claude-fable-5-2' }]);
     });
 });

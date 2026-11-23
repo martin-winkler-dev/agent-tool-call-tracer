@@ -1,6 +1,16 @@
 #!/usr/bin/env bun
 import { Database } from 'bun:sqlite';
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import {
+    appendFileSync,
+    closeSync,
+    existsSync,
+    fstatSync,
+    mkdirSync,
+    openSync,
+    readFileSync,
+    readSync,
+    statSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -54,6 +64,23 @@ export type AgyStep = {
 /** Subset of tool_calls queried during Antigravity transcript backfill operations. */
 type PendingRow = { id: number; call_id: string; tool_name: string; error: string | null; extra: string | null };
 
+/** Subset of tool_calls queried during Claude Code model backfill operations. */
+type ClaudePendingRow = {
+    id: number;
+    ts: string;
+    session_id: string;
+    subagent_id: string | null;
+    call_id: string;
+    extra: string | null;
+};
+
+/** Scope limiting a Claude Code model backfill to a single session or subagent. */
+export type ClaudeBackfillScope = {
+    sessionId: string;
+    subagentId?: string | null | undefined;
+    transcriptPath: string | null;
+};
+
 /** Status counters for resolved, pending, and background tasks after a transcript fill. */
 export type FillResult = { filled: number; pending: number; background: number };
 
@@ -62,10 +89,19 @@ export type FillResult = { filled: number; pending: number; background: number }
 // -------------------------------------------------------------------
 
 /** SQLite schema version tracked in PRAGMA user_version. */
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 4;
 
 /** Maximum time window (24h) in milliseconds for resolving missing transcript steps. */
 const AGY_BACKFILL_MS = 24 * 60 * 60 * 1000;
+
+/** Chunk size in bytes when reading transcript JSONL files backwards from the tail. */
+const TRANSCRIPT_CHUNK_BYTES = 256 * 1024;
+
+/** Maximum bytes scanned from the tail during a blocking live AGY backfill. */
+const AGY_LIVE_MAX_BYTES = 2 * 1024 * 1024;
+
+/** Grace period (10 min) before live Claude Stop hooks mark an unfound row as model_missing. */
+const CLAUDE_MISSING_GRACE_MS = 10 * 60 * 1000;
 
 /** Matches leading lowercase drive letters in absolute Windows file paths. */
 const MATCH_WINDOWS_DRIVE_PREFIX = /^[a-z]:/;
@@ -135,6 +171,9 @@ const AGY_MAPPED = [
 /** SQL condition matching Antigravity tool calls awaiting final transcript results. */
 const AGY_PENDING = `agent = 'agy' AND (json_extract(extra, '$.step_status') IS NULL OR json_extract(extra, '$.step_status') IN ('RUNNING', 'BACKGROUND'))`;
 
+/** SQL condition matching Claude Code tool calls awaiting model resolution from transcripts. */
+const CLAUDE_PENDING = `agent = 'claude' AND model IS NULL AND json_extract(extra, '$.model_missing') IS NULL`;
+
 /** SQLite table and index definitions with composite keys and partial indexes. */
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS tool_calls (
@@ -169,6 +208,8 @@ CREATE INDEX IF NOT EXISTS tool_calls_tool ON tool_calls(tool, ts);
 CREATE INDEX IF NOT EXISTS tool_calls_root ON tool_calls(root, ts);
 DROP INDEX IF EXISTS tool_calls_agy_pending;
 CREATE INDEX tool_calls_agy_pending ON tool_calls(ts) WHERE ${AGY_PENDING};
+DROP INDEX IF EXISTS tool_calls_claude_pending;
+CREATE INDEX tool_calls_claude_pending ON tool_calls(session_id, subagent_id, ts) WHERE ${CLAUDE_PENDING};
 `;
 
 /** Ordered column names matching tool_calls table schema for prepared insert parameters. */
@@ -205,9 +246,10 @@ const INSERT_TOOL_CALL_SQL = `INSERT OR IGNORE INTO tool_calls (${COLUMNS.join('
 // --- 3. Exported Functions
 // -------------------------------------------------------------------
 
-/** Resolves SQLite database path from AGENT_LOG_DB override or user home directory default. */
+/** Resolves SQLite database path from AGENT_LOG_DB override (relative paths resolve from home) or default. */
 export function logFile(env: Record<string, string | undefined>): string {
-    return str(env.AGENT_LOG_DB) ?? join(homedir(), '.agent-tool-call-tracer', 'log.sqlite');
+    const custom = str(env.AGENT_LOG_DB);
+    return custom !== null ? resolve(homedir(), custom) : join(homedir(), '.agent-tool-call-tracer', 'log.sqlite');
 }
 
 /** Standardizes repository paths across platforms, capitalizing Windows drive prefixes. */
@@ -247,6 +289,7 @@ export function fromClaude(payload: Json, env: Record<string, string | undefined
     let stderr: string | null = null;
     let interrupted: 0 | 1 | null = payload.is_interrupt === true ? 1 : null;
     let extraSource = payload;
+    let shellCompleted = false;
     if (typeof response === 'string') {
         output = response;
     } else if (response !== undefined && response !== null) {
@@ -255,6 +298,13 @@ export function fromClaude(payload: Json, env: Record<string, string | undefined
             output = fields.stdout;
             stderr = str(fields.stderr);
             interrupted = fields.interrupted === true ? 1 : 0;
+            shellCompleted =
+                !failed &&
+                (toolName === 'Bash' || toolName === 'PowerShell') &&
+                interrupted === 0 &&
+                input.run_in_background !== true &&
+                str(fields.backgroundTaskId) === null &&
+                str(fields.returnCodeInterpretation) === null;
             const rest = without(fields, BASH_MAPPED);
             if (Object.keys(rest).length > 0) {
                 extraSource = { ...payload, bash_response: rest };
@@ -264,6 +314,7 @@ export function fromClaude(payload: Json, env: Record<string, string | undefined
         }
     }
     const exitMatch = error?.match(MATCH_CLAUDE_EXIT_CODE);
+    const exitCode = exitMatch ? Number(exitMatch[1]) : shellCompleted ? 0 : null;
     return {
         ts: now.toISOString(),
         agent: 'claude',
@@ -281,7 +332,7 @@ export function fromClaude(payload: Json, env: Record<string, string | undefined
         file_path: str(input.file_path) ?? str(input.notebook_path),
         failed: failed ? 1 : 0,
         error,
-        exit_code: exitMatch ? Number(exitMatch[1]) : null,
+        exit_code: exitCode,
         interrupted,
         output,
         stderr,
@@ -294,11 +345,8 @@ export function fromClaude(payload: Json, env: Record<string, string | undefined
 /** Reads transcript content, prioritizing transcript_full.jsonl over truncated transcript.jsonl. */
 export function readTranscript(transcriptPath: string): string | null {
     try {
-        const full = join(dirname(transcriptPath), 'transcript_full.jsonl');
-        if (existsSync(full)) {
-            return readFileSync(full, 'utf8');
-        }
-        return existsSync(transcriptPath) ? readFileSync(transcriptPath, 'utf8') : null;
+        const path = agyTranscriptPath(transcriptPath);
+        return path !== null ? readFileSync(path, 'utf8') : null;
     } catch {
         return null;
     }
@@ -399,21 +447,43 @@ export function toRow(
 /**
  * **Synchronizes pending Antigravity rows with transcript outputs**.
  *
- * - reads transcript files outside the write transaction to prevent lock contention
+ * - reads transcript files backwards outside the write transaction to prevent lock contention
  * - extracts exit codes and execution failure indicators from completed steps
  * - updates pending records within an immediate database transaction
- * - skips BACKGROUND rows on the live hook path (since set), because AGY never rewrites their step
+ * - on the live hook path (since/sessionId set), skips BACKGROUND rows, scopes to the current conversation
+ *   and its parent/child subagent conversations, and caps the tail scan to `AGY_LIVE_MAX_BYTES`
  */
-export function backfillAgy(db: Database, since: string | null): number {
+export function backfillAgy(
+    db: Database,
+    since: string | null,
+    sessionId?: string,
+    parentSessionId?: string | null,
+): number {
     const filter =
         since !== null ? `${AGY_PENDING} AND json_extract(extra, '$.step_status') IS NOT 'BACKGROUND'` : AGY_PENDING;
-    const pending = db
-        .query(
-            `SELECT id, call_id, tool_name, error, extra FROM tool_calls INDEXED BY tool_calls_agy_pending WHERE ${filter} AND ts >= ?`,
-        )
-        .all(since ?? '') as PendingRow[];
-    const transcripts = new Map<string, string | null>();
-    const updates: (string | number | null)[][] = [];
+    const pending =
+        sessionId !== undefined
+            ? (db
+                  .query(
+                      `SELECT id, call_id, tool_name, error, extra FROM tool_calls INDEXED BY tool_calls_agy_pending WHERE ${filter} AND ts >= ? AND (session_id = ? OR parent_session_id = ? OR (? IS NOT NULL AND session_id = ?))`,
+                  )
+                  .all(
+                      since ?? '',
+                      sessionId,
+                      sessionId,
+                      parentSessionId ?? null,
+                      parentSessionId ?? null,
+                  ) as PendingRow[])
+            : (db
+                  .query(
+                      `SELECT id, call_id, tool_name, error, extra FROM tool_calls INDEXED BY tool_calls_agy_pending WHERE ${filter} AND ts >= ?`,
+                  )
+                  .all(since ?? '') as PendingRow[]);
+    if (pending.length === 0) {
+        return 0;
+    }
+    const items: { row: PendingRow; extra: Json; transcriptPath: string; stepIdx: number }[] = [];
+    const neededByPath = new Map<string, Set<number>>();
     for (const row of pending) {
         let extra: Json = {};
         if (row.extra) {
@@ -428,11 +498,22 @@ export function backfillAgy(db: Database, since: string | null): number {
         if (transcriptPath === null || !Number.isInteger(stepIdx)) {
             continue;
         }
-        if (!transcripts.has(transcriptPath)) {
-            transcripts.set(transcriptPath, readTranscript(transcriptPath));
+        items.push({ row, extra, transcriptPath, stepIdx });
+        let needed = neededByPath.get(transcriptPath);
+        if (needed === undefined) {
+            needed = new Set();
+            neededByPath.set(transcriptPath, needed);
         }
-        const text = transcripts.get(transcriptPath);
-        const step = text ? findAgyStep(text, stepIdx) : null;
+        needed.add(stepIdx);
+    }
+    const maxBytes = sessionId !== undefined ? AGY_LIVE_MAX_BYTES : undefined;
+    const stepsByPath = new Map<string, Map<number, AgyStep>>();
+    for (const [transcriptPath, needed] of neededByPath) {
+        stepsByPath.set(transcriptPath, readAgySteps(transcriptPath, needed, maxBytes));
+    }
+    const updates: (string | number | null)[][] = [];
+    for (const { row, extra, transcriptPath, stepIdx } of items) {
+        const step = stepsByPath.get(transcriptPath)?.get(stepIdx) ?? null;
         if (step === null) {
             continue;
         }
@@ -468,31 +549,196 @@ export function backfillAgy(db: Database, since: string | null): number {
         .immediate();
 }
 
-/** Persists normalized row into database and triggers backfill for recent Antigravity calls. */
-export function writeRow(row: ToolCallRow, now = new Date(), file = logFile(process.env)): void {
+/**
+ * **Maps Claude Code tool_use ids to the model that emitted them**.
+ *
+ * - skips lines without a tool_use block before parsing JSON
+ * - ignores partial or malformed lines at the tail of an active transcript
+ */
+export function parseClaudeModels(text: string): Map<string, string> {
+    const models = new Map<string, string>();
+    parseClaudeModelsInto(text, models);
+    return models;
+}
+
+/**
+ * **Resolves the Claude Code transcript JSONL file for a session or subagent**.
+ *
+ * - returns main session transcript directly when subagentId is null
+ * - returns transcriptPath directly when it already points to the subagent transcript
+ * - checks `<dir>/<sessionId>/subagents/agent-<subagentId>.jsonl`, then `<dir>/agent-<subagentId>.jsonl`
+ */
+export function claudeTranscriptPath(transcriptPath: string, sessionId: string, subagentId: string | null): string {
+    if (subagentId === null) {
+        return transcriptPath;
+    }
+    const fileName = `agent-${subagentId}.jsonl`;
+    if (transcriptPath.endsWith(fileName)) {
+        return transcriptPath;
+    }
+    const baseDir = dirname(transcriptPath);
+    const nested = join(baseDir, sessionId, 'subagents', fileName);
+    if (existsSync(nested)) {
+        return nested;
+    }
+    const flat = join(baseDir, fileName);
+    if (existsSync(flat)) {
+        return flat;
+    }
+    return nested;
+}
+
+/**
+ * **Backfills missing Claude Code model names from session and subagent transcripts**.
+ *
+ * - reads each referenced transcript file backwards in chunks until all needed call_ids are found
+ * - marks rows `extra.model_missing = 1` when unresolvable (no transcript path, absent after a full scan
+ *   of an existing transcript, or missing transcript older than 24h during `--fill`)
+ * - updates only rows that still have model IS NULL inside an immediate transaction
+ */
+export function backfillClaude(db: Database, scope?: ClaudeBackfillScope): number {
+    let pending: ClaudePendingRow[];
+    if (scope && scope.subagentId !== undefined) {
+        pending = db
+            .query(
+                `SELECT id, ts, session_id, subagent_id, call_id, extra FROM tool_calls INDEXED BY tool_calls_claude_pending WHERE ${CLAUDE_PENDING} AND session_id = ? AND subagent_id IS ?`,
+            )
+            .all(scope.sessionId, scope.subagentId) as ClaudePendingRow[];
+    } else if (scope) {
+        pending = db
+            .query(
+                `SELECT id, ts, session_id, subagent_id, call_id, extra FROM tool_calls INDEXED BY tool_calls_claude_pending WHERE ${CLAUDE_PENDING} AND session_id = ?`,
+            )
+            .all(scope.sessionId) as ClaudePendingRow[];
+    } else {
+        pending = db
+            .query(
+                `SELECT id, ts, session_id, subagent_id, call_id, extra FROM tool_calls INDEXED BY tool_calls_claude_pending WHERE ${CLAUDE_PENDING}`,
+            )
+            .all() as ClaudePendingRow[];
+    }
+    if (pending.length === 0) {
+        return 0;
+    }
+    const items: { row: ClaudePendingRow; path: string }[] = [];
+    const neededByPath = new Map<string, Set<string>>();
+    const missingIds: number[] = [];
+    for (const row of pending) {
+        let basePath = scope?.transcriptPath ?? null;
+        if (basePath === null && row.extra) {
+            try {
+                basePath = toPath(obj(JSON.parse(row.extra)).transcript_path);
+            } catch {
+                basePath = null;
+            }
+        }
+        if (basePath === null) {
+            missingIds.push(row.id);
+            continue;
+        }
+        const path = claudeTranscriptPath(basePath, row.session_id, row.subagent_id);
+        items.push({ row, path });
+        let needed = neededByPath.get(path);
+        if (needed === undefined) {
+            needed = new Set();
+            neededByPath.set(path, needed);
+        }
+        needed.add(row.call_id);
+    }
+    const transcripts = new Map<string, { models: Map<string, string>; exists: boolean; exhausted: boolean }>();
+    for (const [path, needed] of neededByPath) {
+        transcripts.set(path, readClaudeModels(path, needed));
+    }
+    const updates: [string, number][] = [];
+    const nowMs = Date.now();
+    const graceCutoff = nowMs - CLAUDE_MISSING_GRACE_MS;
+    const staleCutoff = nowMs - AGY_BACKFILL_MS;
+    for (const { row, path } of items) {
+        const result = transcripts.get(path);
+        const model = result?.models.get(row.call_id);
+        if (model !== undefined) {
+            updates.push([model, row.id]);
+        } else if (
+            (result?.exhausted && (scope === undefined || Date.parse(row.ts) < graceCutoff)) ||
+            (!result?.exists && scope === undefined && Date.parse(row.ts) < staleCutoff)
+        ) {
+            missingIds.push(row.id);
+        }
+    }
+    if (updates.length === 0 && missingIds.length === 0) {
+        return 0;
+    }
+    const updateModel = db.query(`UPDATE tool_calls SET model = ? WHERE id = ? AND model IS NULL`);
+    const markMissing = db.query(
+        `UPDATE tool_calls SET extra = json_set(coalesce(extra, '{}'), '$.model_missing', 1) WHERE id = ? AND model IS NULL`,
+    );
+    return db
+        .transaction(() => {
+            const filled = updates.reduce((count, values) => count + updateModel.run(...values).changes, 0);
+            for (const id of missingIds) {
+                markMissing.run(id);
+            }
+            return filled;
+        })
+        .immediate();
+}
+
+/** Handles Claude Code Stop, SubagentStop and SessionEnd payloads by backfilling pending models. */
+export function handleClaudeStop(payload: Json, file = logFile(process.env)): number {
+    const sessionId = str(payload.session_id);
+    if (sessionId === null) {
+        return 0;
+    }
+    const isSubagent = payload.hook_event_name === 'SubagentStop';
+    const subagentId = isSubagent ? str(payload.agent_id) : undefined;
+    if (isSubagent && subagentId === null) {
+        return 0;
+    }
+    const transcriptPath =
+        (isSubagent ? toPath(payload.agent_transcript_path) : null) ?? toPath(payload.transcript_path);
     const db = openDb(file);
     try {
-        db.query(INSERT_TOOL_CALL_SQL).run(...COLUMNS.map((column) => row[column]));
-        if (row.agent === 'agy') {
-            backfillAgy(db, new Date(now.getTime() - AGY_BACKFILL_MS).toISOString());
-        }
+        return backfillClaude(db, { sessionId, subagentId, transcriptPath });
     } finally {
         db.close();
     }
 }
 
-/** Backfills all historical pending Antigravity rows without age constraints. */
+/** Persists normalized row into database and triggers backfill for earlier Antigravity calls in related conversations. */
+export function writeRow(row: ToolCallRow, now = new Date(), file = logFile(process.env)): void {
+    const db = openDb(file);
+    try {
+        if (row.agent === 'agy') {
+            backfillAgy(
+                db,
+                new Date(now.getTime() - AGY_BACKFILL_MS).toISOString(),
+                row.session_id,
+                row.parent_session_id,
+            );
+        }
+        db.query(INSERT_TOOL_CALL_SQL).run(...COLUMNS.map((column) => row[column]));
+    } finally {
+        db.close();
+    }
+}
+
+/** Backfills all historical pending Antigravity and Claude Code rows without age constraints. */
 export function fillLog(file = logFile(process.env)): FillResult {
     const db = openDb(file);
     try {
-        const filled = backfillAgy(db, null);
-        const { pending, background } = db
+        const filled = backfillAgy(db, null) + backfillClaude(db);
+        const { pending: agyPending, background } = db
             .query(
                 `SELECT count(*) AS pending, count(*) FILTER (WHERE json_extract(extra, '$.step_status') = 'BACKGROUND') AS background
                  FROM tool_calls INDEXED BY tool_calls_agy_pending WHERE ${AGY_PENDING}`,
             )
             .get() as { pending: number; background: number };
-        return { filled, pending: pending - background, background };
+        const { pending: claudePending } = db
+            .query(
+                `SELECT count(*) AS pending FROM tool_calls INDEXED BY tool_calls_claude_pending WHERE ${CLAUDE_PENDING}`,
+            )
+            .get() as { pending: number };
+        return { filled, pending: agyPending - background + claudePending, background };
     } finally {
         db.close();
     }
@@ -631,10 +877,165 @@ function schemaVersion(db: Database): number {
     return (db.query('PRAGMA user_version').get() as { user_version: number }).user_version;
 }
 
-/** Reads hook payload from standard input and commits normalized row. */
+/** Resolves the existing Antigravity transcript path, preferring transcript_full.jsonl. */
+function agyTranscriptPath(transcriptPath: string): string | null {
+    const full = join(dirname(transcriptPath), 'transcript_full.jsonl');
+    if (existsSync(full)) {
+        return full;
+    }
+    return existsSync(transcriptPath) ? transcriptPath : null;
+}
+
+/**
+ * **Reads a UTF-8 JSONL file backwards in chunks along newline boundaries**.
+ *
+ * - splits strictly on `0x0a` bytes so multi-byte UTF-8 sequences never split across chunks
+ * - buffers chunks of lines larger than one chunk in an array and concatenates once (linear time)
+ * - stops early when `onChunk` returns true or `maxBytes` has been scanned
+ * - returns true only when the full file was read cleanly to byte 0 without stopping early
+ */
+function readLinesBackwards(path: string, onChunk: (text: string) => boolean, maxBytes?: number): boolean {
+    let fd: number;
+    try {
+        fd = openSync(path, 'r');
+    } catch {
+        return false;
+    }
+    try {
+        let offset = fstatSync(fd).size;
+        let scanned = 0;
+        let pendingChunks: Buffer<ArrayBufferLike>[] = [];
+        while (offset > 0) {
+            if (maxBytes !== undefined && scanned >= maxBytes) {
+                return false;
+            }
+            const length = Math.min(TRANSCRIPT_CHUNK_BYTES, offset);
+            offset -= length;
+            scanned += length;
+            const chunk = Buffer.allocUnsafe(length);
+            let bytesRead = 0;
+            while (bytesRead < length) {
+                const n = readSync(fd, chunk, bytesRead, length - bytesRead, offset + bytesRead);
+                if (n <= 0) {
+                    return false;
+                }
+                bytesRead += n;
+            }
+            const slice = chunk.subarray(0, bytesRead);
+            if (offset > 0) {
+                const firstNl = slice.indexOf(0x0a);
+                if (firstNl < 0) {
+                    pendingChunks.push(slice);
+                    continue;
+                }
+                const tail = slice.subarray(firstNl + 1);
+                const combined = pendingChunks.length > 0 ? Buffer.concat([tail, ...pendingChunks.reverse()]) : tail;
+                pendingChunks = [slice.subarray(0, firstNl)];
+                if (onChunk(combined.toString('utf8'))) {
+                    return false;
+                }
+            } else {
+                const combined = pendingChunks.length > 0 ? Buffer.concat([slice, ...pendingChunks.reverse()]) : slice;
+                return !onChunk(combined.toString('utf8'));
+            }
+        }
+        return false;
+    } catch {
+        return false;
+    } finally {
+        closeSync(fd);
+    }
+}
+
+/** Reads the latest non-planner Antigravity steps for the given indices from the transcript tail. */
+function readAgySteps(transcriptPath: string, needed: ReadonlySet<number>, maxBytes?: number): Map<number, AgyStep> {
+    const found = new Map<number, AgyStep>();
+    const path = agyTranscriptPath(transcriptPath);
+    if (path === null) {
+        return found;
+    }
+    readLinesBackwards(
+        path,
+        (text) => {
+            for (const stepIdx of needed) {
+                if (!found.has(stepIdx)) {
+                    const step = findAgyStep(text, stepIdx);
+                    if (step !== null) {
+                        found.set(stepIdx, step);
+                    }
+                }
+            }
+            return found.size === needed.size;
+        },
+        maxBytes,
+    );
+    return found;
+}
+
+/** Parses Claude Code tool_use model mappings from text into an existing map. */
+function parseClaudeModelsInto(text: string, models: Map<string, string>): void {
+    for (const line of text.split('\n')) {
+        if (!line.includes('"tool_use"')) {
+            continue;
+        }
+        try {
+            const entry = obj(JSON.parse(line));
+            const message = obj(entry.message);
+            if (entry.type !== 'assistant' && message.role !== 'assistant') {
+                continue;
+            }
+            const model = str(message.model);
+            if (model === null || !Array.isArray(message.content)) {
+                continue;
+            }
+            for (const block of message.content) {
+                const item = obj(block);
+                const id = item.type === 'tool_use' ? str(item.id) : null;
+                if (id !== null && !models.has(id)) {
+                    models.set(id, model);
+                }
+            }
+        } catch {
+            // partial last line while the agent is still writing
+        }
+    }
+}
+
+/** Reads and parses model mappings from a Claude Code transcript file, scanning backwards until all needed ids are found. */
+function readClaudeModels(
+    path: string,
+    needed: ReadonlySet<string>,
+): { models: Map<string, string>; exists: boolean; exhausted: boolean } {
+    const models = new Map<string, string>();
+    if (!existsSync(path) || statSync(path).size === 0) {
+        return { models, exists: false, exhausted: false };
+    }
+    const exhausted = readLinesBackwards(path, (text) => {
+        parseClaudeModelsInto(text, models);
+        for (const id of needed) {
+            if (!models.has(id)) {
+                return false;
+            }
+        }
+        return true;
+    });
+    return { models, exists: true, exhausted };
+}
+
+/** Reads hook payload from standard input and commits normalized row or runs stop backfill. */
 async function main(): Promise<void> {
     const payload = obj(JSON.parse(await Bun.stdin.text()));
-    const row = toRow(detectAgent(process.argv, payload), payload, process.env);
+    const agent = detectAgent(process.argv, payload);
+    if (
+        agent === 'claude' &&
+        (payload.hook_event_name === 'Stop' ||
+            payload.hook_event_name === 'SubagentStop' ||
+            payload.hook_event_name === 'SessionEnd')
+    ) {
+        handleClaudeStop(payload);
+        return;
+    }
+    const row = toRow(agent, payload, process.env);
     if (row !== null) {
         writeRow(row);
     }
